@@ -4,9 +4,12 @@
 #include <QCloseEvent>
 #include <QDateTime>
 #include <QDoubleSpinBox>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QFrame>
 #include <QButtonGroup>
 #include <QCheckBox>
+#include <QHeaderView>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -21,6 +24,8 @@
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSplitter>
+#include <QTableWidget>
+#include <QTableWidgetItem>
 #include <QTimer>
 #include <QToolButton>
 #include <QVector>
@@ -52,6 +57,70 @@ QFrame *makeMetricCard(const QString &title, QLabel **valueLabel)
 QString printableOrDash(const QString &value)
 {
     return value.isEmpty() ? QStringLiteral("--") : value;
+}
+
+QString csvField(const QString &value)
+{
+    QString escaped = value;
+    escaped.replace(QLatin1Char('"'), QStringLiteral("\"\""));
+    if (escaped.contains(QLatin1Char(',')) || escaped.contains(QLatin1Char('"'))
+        || escaped.contains(QLatin1Char('\n')) || escaped.contains(QLatin1Char('\r')))
+        return QLatin1Char('"') + escaped + QLatin1Char('"');
+    return escaped;
+}
+
+QStringList recordingHeaders()
+{
+    return {QStringLiteral("时间"), QStringLiteral("位置(圈)"), QStringLiteral("速度(圈/秒)"),
+            QStringLiteral("电流(mA)"), QStringLiteral("运行状态"), QStringLiteral("功率级"),
+            QStringLiteral("模式"), QStringLiteral("已校准"), QStringLiteral("堵转"),
+            QStringLiteral("过载"), QStringLiteral("ISR最大耗时(us)"),
+            QStringLiteral("ISR警告"), QStringLiteral("UART丢字节"), QStringLiteral("UART错误"),
+            QStringLiteral("SPI错误"), QStringLiteral("SPI状态"), QStringLiteral("控制器(tgt/est/err)"),
+            QStringLiteral("DCE参数"), QStringLiteral("DCE输出"), QStringLiteral("CAN状态"),
+            QStringLiteral("电流上限(mA)"), QStringLiteral("速度上限(圈/秒)")};
+}
+
+QStringList recordingValues(const XdrvStatus &status, qint64 sampleTime)
+{
+    const auto optionalInteger = [](const auto &value) {
+        return value ? QString::number(*value) : QString();
+    };
+    const QString position = status.positionMilliRev
+                                 ? QString::number(*status.positionMilliRev / 1000.0, 'f', 3)
+                                 : QString();
+    const QString velocity = status.velocityMilliRevPerSec
+                                 ? QString::number(*status.velocityMilliRevPerSec / 1000.0, 'f', 3)
+                                 : QString();
+    const QString calibrated = status.calibrated
+                                   ? (*status.calibrated ? QStringLiteral("是") : QStringLiteral("否"))
+                                   : QString();
+    const QString velocityLimit = status.velocityLimitRevPerSec
+                                      ? QString::number(*status.velocityLimitRevPerSec, 'f', 3)
+                                      : QString();
+    static const QRegularExpression dcePattern(
+        QStringLiteral("ki=(-?\\d+)\\s+out=(-?\\d+)\\s+\\(kp=(-?\\d+)\\s+kv=(-?\\d+)\\s+ki=(-?\\d+)\\s+kd=(-?\\d+)\\)"));
+    const auto dceMatch = dcePattern.match(status.dce);
+    const QString dceGains =
+        dceMatch.hasMatch()
+            ? QStringLiteral("%1 / %2 / %3 / %4")
+                  .arg(dceMatch.captured(3), dceMatch.captured(4),
+                       dceMatch.captured(5), dceMatch.captured(6))
+            : status.dce;
+    const QString dceOutput =
+        dceMatch.hasMatch()
+            ? QStringLiteral("%1 / %2").arg(dceMatch.captured(1), dceMatch.captured(2))
+            : QString();
+    return {QDateTime::fromMSecsSinceEpoch(sampleTime).toString(Qt::ISODateWithMs),
+            position, velocity, optionalInteger(status.currentMilliamp), status.state,
+            status.power, status.mode, calibrated, optionalInteger(status.stalled),
+            optionalInteger(status.overloaded),
+            status.isrMaxMicroseconds ? QString::number(*status.isrMaxMicroseconds, 'f', 2)
+                                      : QString(),
+            status.isrWarning, optionalInteger(status.uartOverruns),
+            optionalInteger(status.uartErrors), optionalInteger(status.spiErrors),
+            status.spiFailure, status.controller, dceGains, dceOutput, status.can,
+            optionalInteger(status.currentLimitMilliamp), velocityLimit};
 }
 
 void selectComboData(QComboBox *combo, int value)
@@ -339,6 +408,24 @@ void MainWindow::buildUi()
     m_lastUpdateLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     diagnosticsLayout->addWidget(m_lastUpdateLabel);
     sidebarLayout->addWidget(diagnosticsGroup);
+
+    auto *consoleGroup = new QGroupBox(QStringLiteral("串口收发日志（仅允许发送 xdrv 命令）"));
+    auto *consoleLayout = new QVBoxLayout(consoleGroup);
+    consoleLayout->setContentsMargins(6, 8, 6, 6);
+    consoleLayout->setSpacing(4);
+    m_consoleOutput = new QPlainTextEdit;
+    m_consoleOutput->setReadOnly(true);
+    m_consoleOutput->setMaximumBlockCount(1200);
+    m_consoleOutput->setFixedHeight(100);
+    auto *consoleRow = new QHBoxLayout;
+    m_consoleInput = new QLineEdit;
+    m_consoleInput->setPlaceholderText(QStringLiteral("输入 xdrv 命令"));
+    auto *sendConsoleButton = new QPushButton(QStringLiteral("发送"));
+    consoleRow->addWidget(m_consoleInput, 1);
+    consoleRow->addWidget(sendConsoleButton);
+    consoleLayout->addWidget(m_consoleOutput);
+    consoleLayout->addLayout(consoleRow);
+    sidebarLayout->addWidget(consoleGroup);
     sidebarLayout->addStretch();
 
     controlScroll->setWidget(sidebarContent);
@@ -369,6 +456,38 @@ void MainWindow::buildUi()
     chartLayout->addLayout(plotsColumn, 1);
     rightLayout->addWidget(chartGroup, 1);
 
+    auto *recordGroup = new QGroupBox(QStringLiteral("数据记录（CSV）"));
+    auto *recordLayout = new QVBoxLayout(recordGroup);
+    recordLayout->setContentsMargins(6, 8, 6, 6);
+    recordLayout->setSpacing(4);
+    auto *recordHeader = new QHBoxLayout;
+    m_recordStatusLabel = new QLabel(QStringLiteral("未记录"));
+    m_recordStatusLabel->setObjectName(QStringLiteral("recordStatus"));
+    m_startRecordingButton = new QPushButton(QStringLiteral("开始记录"));
+    m_startRecordingButton->setObjectName(QStringLiteral("successButton"));
+    m_stopRecordingButton = new QPushButton(QStringLiteral("停止并保存"));
+    m_stopRecordingButton->setEnabled(false);
+    recordHeader->addWidget(m_recordStatusLabel, 1);
+    recordHeader->addWidget(m_startRecordingButton);
+    recordHeader->addWidget(m_stopRecordingButton);
+    recordLayout->addLayout(recordHeader);
+    m_recordTable = new QTableWidget(0, recordingHeaders().size());
+    m_recordTable->setHorizontalHeaderLabels(recordingHeaders());
+    m_recordTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_recordTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_recordTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_recordTable->setAlternatingRowColors(true);
+    m_recordTable->setShowGrid(true);
+    m_recordTable->verticalHeader()->setVisible(false);
+    m_recordTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+    m_recordTable->horizontalHeader()->setDefaultSectionSize(115);
+    m_recordTable->horizontalHeader()->setMinimumSectionSize(75);
+    m_recordTable->setColumnWidth(0, 170);
+    m_recordTable->setMinimumHeight(140);
+    m_recordTable->setMaximumHeight(220);
+    recordLayout->addWidget(m_recordTable);
+    rightLayout->addWidget(recordGroup);
+
     mainSplitter->addWidget(controlScroll);
     mainSplitter->addWidget(rightPanel);
     mainSplitter->setStretchFactor(0, 0);
@@ -376,28 +495,16 @@ void MainWindow::buildUi()
     mainSplitter->setSizes({318, 1002});
     root->addWidget(mainSplitter, 1);
 
-    auto *consoleGroup = new QGroupBox(QStringLiteral("串口收发日志（仅允许发送 xdrv 命令）"));
-    auto *consoleLayout = new QVBoxLayout(consoleGroup);
-    m_consoleOutput = new QPlainTextEdit;
-    m_consoleOutput->setReadOnly(true);
-    m_consoleOutput->setMaximumBlockCount(1200);
-    m_consoleOutput->setFixedHeight(72);
-    auto *consoleRow = new QHBoxLayout;
-    m_consoleInput = new QLineEdit;
-    m_consoleInput->setPlaceholderText(QStringLiteral("例如：xdrv status 或 xdrv pos 1000"));
-    auto *sendConsoleButton = new QPushButton(QStringLiteral("发送"));
-    consoleRow->addWidget(m_consoleInput, 1);
-    consoleRow->addWidget(sendConsoleButton);
-    consoleLayout->addWidget(m_consoleOutput);
-    consoleLayout->addLayout(consoleRow);
-    rightLayout->addWidget(consoleGroup);
-
     setCentralWidget(central);
     QTimer::singleShot(0, controlScroll,
                        [controlScroll] { controlScroll->verticalScrollBar()->setValue(0); });
 
     connect(m_refreshPortsButton, &QPushButton::clicked, this, [this] { refreshPorts(); });
     connect(m_connectButton, &QPushButton::clicked, this, [this] { toggleConnection(); });
+    connect(m_startRecordingButton, &QPushButton::clicked, this,
+            [this] { startDataRecording(); });
+    connect(m_stopRecordingButton, &QPushButton::clicked, this,
+            [this] { stopDataRecording(); });
     connect(sendTargetButton, &QPushButton::clicked, this, [this] { sendMotionTarget(); });
     connect(m_positionModeCheck, &QCheckBox::toggled, this, [this](bool checked) {
         if (checked)
@@ -474,6 +581,10 @@ void MainWindow::applyStyle()
         QLabel#diagnosticsTimestamp { color: #888888; font-size: 7pt; }
         QToolButton#diagnosticSectionHeader { background: #252525; color: #aaaaaa; border: none; padding: 2px; text-align: left; }
         QWidget#diagnosticSectionContent { background: #202020; border-top: 1px solid #3b3b3b; }
+        QLabel#recordStatus { color: #9a9a9a; font-size: 8pt; }
+        QTableWidget { background: #080808; alternate-background-color: #111111; gridline-color: #333333; border: 1px solid #383838; }
+        QTableWidget::item { padding: 2px 5px; }
+        QHeaderView::section { background: #252525; color: #b6b6b6; border: 1px solid #383838; padding: 3px 5px; }
         QComboBox, QDoubleSpinBox, QLineEdit { background: #303030; border: 1px solid #484848; border-radius: 3px; padding: 4px; selection-background-color: #167bc0; }
         QComboBox:disabled, QDoubleSpinBox:disabled, QLineEdit:disabled { color: #777777; }
         QDoubleSpinBox { min-height: 34px; padding-right: 32px; }
@@ -550,8 +661,110 @@ QString MainWindow::selectedPortName() const
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    stopDataRecording();
     saveSerialSettings();
     QMainWindow::closeEvent(event);
+}
+
+void MainWindow::startDataRecording()
+{
+    if (!m_serial->isOpen())
+    {
+        QMessageBox::information(this, QStringLiteral("尚未连接"),
+                                 QStringLiteral("请先连接驱动，再开始记录数据。"));
+        return;
+    }
+
+    const QString defaultName =
+        QStringLiteral("XDriverLog_%1.csv")
+            .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss")));
+    QString fileName = QFileDialog::getSaveFileName(
+        this, QStringLiteral("保存数据记录"), defaultName, QStringLiteral("CSV 文件 (*.csv)"));
+    if (fileName.isEmpty())
+        return;
+    if (QFileInfo(fileName).suffix().isEmpty())
+        fileName += QStringLiteral(".csv");
+
+    m_recordFile.setFileName(fileName);
+    if (!m_recordFile.open(QIODevice::WriteOnly))
+    {
+        QMessageBox::critical(this, QStringLiteral("无法开始记录"),
+                              QStringLiteral("无法创建 CSV 文件：%1").arg(m_recordFile.errorString()));
+        return;
+    }
+
+    QStringList headerFields;
+    for (const QString &header : recordingHeaders())
+        headerFields.append(csvField(header));
+    const QByteArray header = QByteArray::fromHex("efbbbf")
+                              + (headerFields.join(QLatin1Char(',')) + QStringLiteral("\r\n")).toUtf8();
+    if (m_recordFile.write(header) != header.size())
+    {
+        const QString error = m_recordFile.errorString();
+        m_recordFile.close();
+        QMessageBox::critical(this, QStringLiteral("无法开始记录"),
+                              QStringLiteral("写入 CSV 表头失败：%1").arg(error));
+        return;
+    }
+
+    m_recordTable->setRowCount(0);
+    m_recordStatusLabel->setText(QStringLiteral("记录中：%1").arg(QFileInfo(fileName).fileName()));
+    m_recordStatusLabel->setToolTip(fileName);
+    m_recordStatusLabel->setStyleSheet(QStringLiteral("color: #42d36b;"));
+    m_startRecordingButton->setEnabled(false);
+    m_stopRecordingButton->setEnabled(true);
+}
+
+void MainWindow::stopDataRecording()
+{
+    if (!m_recordFile.isOpen())
+        return;
+
+    const bool flushed = m_recordFile.flush();
+    const QString error = flushed ? QString() : m_recordFile.errorString();
+    m_recordFile.close();
+    m_recordStatusLabel->setText(flushed ? QStringLiteral("已停止并保存")
+                                         : QStringLiteral("保存失败"));
+    m_recordStatusLabel->setStyleSheet(flushed ? QStringLiteral("color: #9a9a9a;")
+                                                : QStringLiteral("color: #ff7070;"));
+    m_startRecordingButton->setEnabled(true);
+    m_stopRecordingButton->setEnabled(false);
+
+    if (!flushed)
+        QMessageBox::critical(this, QStringLiteral("保存 CSV 失败"), error);
+}
+
+void MainWindow::recordStatusSnapshot(const XdrvStatus &status, qint64 sampleTime)
+{
+    if (!m_recordFile.isOpen())
+        return;
+
+    const QStringList values = recordingValues(status, sampleTime);
+    QStringList csvValues;
+    csvValues.reserve(values.size());
+    for (const QString &value : values)
+        csvValues.append(csvField(value));
+    const QByteArray csvRow = (csvValues.join(QLatin1Char(',')) + QStringLiteral("\r\n")).toUtf8();
+    if (m_recordFile.write(csvRow) != csvRow.size() || !m_recordFile.flush())
+    {
+        const QString error = m_recordFile.errorString();
+        m_recordFile.close();
+        m_recordStatusLabel->setText(QStringLiteral("记录失败"));
+        m_recordStatusLabel->setStyleSheet(QStringLiteral("color: #ff7070;"));
+        m_startRecordingButton->setEnabled(true);
+        m_stopRecordingButton->setEnabled(false);
+        QMessageBox::critical(this, QStringLiteral("CSV 记录失败"), error);
+        return;
+    }
+
+    constexpr int maxVisibleRows = 500;
+    if (m_recordTable->rowCount() >= maxVisibleRows)
+        m_recordTable->removeRow(0);
+    const int row = m_recordTable->rowCount();
+    m_recordTable->insertRow(row);
+    for (int column = 0; column < values.size(); ++column)
+        m_recordTable->setItem(row, column, new QTableWidgetItem(values.at(column)));
+    m_recordTable->scrollToBottom();
 }
 
 void MainWindow::refreshPorts()
@@ -920,6 +1133,8 @@ void MainWindow::updateStatusUi(const XdrvStatus &status)
         const double limit = status.currentLimitMilliamp.value_or(1000);
         m_targetSpin->setRange(-limit, limit);
     }
+
+    recordStatusSnapshot(status, sampleTime);
 }
 
 void MainWindow::updateTargetMode()

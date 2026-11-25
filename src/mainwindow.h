@@ -4,6 +4,7 @@
 #include "timeseriesplot.h"
 
 #include <QByteArray>
+#include <QFile>
 #include <QMainWindow>
 #include <QQueue>
 #include <QSerialPort>
@@ -19,6 +20,7 @@ class QPushButton;
 class QCloseEvent;
 class QButtonGroup;
 class QCheckBox;
+class QTableWidget;
 
 class MainWindow : public QMainWindow
 {
@@ -52,6 +54,9 @@ private:
     void updateStatusUi(const XdrvStatus &status);
     void appendLog(const QString &direction, const QString &text);
     void handleSerialError(QSerialPort::SerialPortError error);
+    void startDataRecording();
+    void stopDataRecording();
+    void recordStatusSnapshot(const XdrvStatus &status, qint64 sampleTime);
 
     QSerialPort *m_serial = nullptr;
     QTimer m_pollTimer;
@@ -97,4 +102,9 @@ private:
     QLabel *m_dceOutputValue = nullptr;
     QLabel *m_canValue = nullptr;
     QLabel *m_limitsValue = nullptr;
+    QTableWidget *m_recordTable = nullptr;
+    QLabel *m_recordStatusLabel = nullptr;
+    QPushButton *m_startRecordingButton = nullptr;
+    QPushButton *m_stopRecordingButton = nullptr;
+    QFile m_recordFile;
 };
